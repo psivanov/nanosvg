@@ -374,6 +374,7 @@ enum NSVGgradientUnits {
 };
 
 #define NSVG_MAX_DASHES 8
+#define NSVG_MAX_CLASSES 32
 
 enum NSVGunits {
 	NSVG_UNITS_USER,
@@ -676,10 +677,8 @@ error:
 static void nsvg__deleteStyles(NSVGstyleDeclaration* style) {
 	while (style) {
 		NSVGstyleDeclaration* next = style->next;
-		if (style->className != NULL)
-			free(style->className);
-		if (style->propertiesText != NULL)
-			free(style->propertiesText);
+		free(style->className);
+		free(style->propertiesText);
 		free(style);
 		style = next;
 	}
@@ -1850,8 +1849,7 @@ static void nsvg__applyClassStyles(NSVGparser* p, const char* value)
 		classLen = (size_t)(cur - classStart);
 
 		for (style = p->styles; style != NULL; style = style->next) {
-			if (strncmp(style->className, classStart, classLen) == 0 &&
-				style->className[classLen] == '\0') {
+			if (strncmp(style->className, classStart, classLen) == 0 && style->className[classLen] == '\0') {
 				nsvg__parseStyle(p, style->propertiesText);
 			}
 		}
@@ -2919,8 +2917,8 @@ static void nsvg__endElement(void* ud, const char* el)
 static char *nsvg__strndup(const char *s, size_t n)
 {
 	char *result = (char *)malloc(n + 1);
-	if (!result)
-		return 0;
+	if (result == NULL)
+		return NULL;
 
 	memcpy(result, s, n);
 	result[n] = '\0';
@@ -2936,16 +2934,20 @@ static void nsvg__content(void* ud, const char* s)
 	// Parse all the styles inside the style block. Each style's content will be later processed using nsvg__parseStyle().
 	// Note: We only support selector lists of simple class selectors (e.g. ".foo, .bar { ... }").
 	while (*s) {
-		int class_count = 0;
+		NSVGstyleDeclaration* styles[NSVG_MAX_CLASSES];
+		int nstyles = 0;
 		const char* propsStart;
 		const char* propsEnd;
-		NSVGstyleDeclaration* style;
+		int i;
 
 		// 1) Parse the selector list up to '{'. For each simple class selector ('.name'),
-		//    push a new NSVGstyleDeclaration onto p->styles (with className stripped of '.' and whitespace).
+		//    allocate a new NSVGstyleDeclaration into the local staging array. Styles are
+		//    only committed to p->styles in step 3 below, once their propertiesText has
+		//    also been allocated successfully.
 		while (*s && *s != '{') {
 			const char* selStart;
 			const char* selEnd;
+			NSVGstyleDeclaration* style;
 
 			while (*s && (nsvg__isspace(*s) || *s == ','))
 				s++;
@@ -2957,19 +2959,30 @@ static void nsvg__content(void* ud, const char* s)
 				s++;
 			selEnd = s;
 
-			if (*selStart == '.') {
-				selStart++; // strip leading '.'
-				style = (NSVGstyleDeclaration*)malloc(sizeof(NSVGstyleDeclaration));
-				style->className = nsvg__strndup(selStart, (size_t)(selEnd - selStart));
-				style->propertiesText = NULL;
-				style->next = p->styles;
-				p->styles = style;
-				++class_count;
+			if (*selStart != '.' || nstyles >= NSVG_MAX_CLASSES)
+				continue; // unsupported selector, or staging array full
+			selStart++; // strip leading '.'
+
+			style = (NSVGstyleDeclaration*)malloc(sizeof(NSVGstyleDeclaration));
+			if (style == NULL)
+				continue;
+			style->className = nsvg__strndup(selStart, (size_t)(selEnd - selStart));
+			if (style->className == NULL) {
+				free(style);
+				continue;
 			}
-			// else: unsupported selector type, silently skipped
+			style->propertiesText = NULL;
+			style->next = NULL;
+			styles[nstyles++] = style;
 		}
-		if (!*s)
+		if (!*s) {
+			// No '{' found - discard pending styles and stop.
+			for (i = 0; i < nstyles; i++) {
+				free(styles[i]->className);
+				free(styles[i]);
+			}
 			break;
+		}
 		s++; // advance past '{'
 
 		// 2) Find the end of the properties block (up to '}').
@@ -2978,13 +2991,19 @@ static void nsvg__content(void* ud, const char* s)
 			s++;
 		propsEnd = s;
 
-		// 3) Dup the properties content into each style we just pushed.
-		style = p->styles;
-		while (class_count > 0) {
-			style->propertiesText = nsvg__strndup(propsStart, (size_t)(propsEnd - propsStart));
-			style = style->next;
-			--class_count;
+		// 3) Allocate propertiesText for each pending style. Commit successful ones to
+		//    p->styles (head-insertion); free any whose allocation fails.
+		for (i = 0; i < nstyles; i++) {
+			styles[i]->propertiesText = nsvg__strndup(propsStart, (size_t)(propsEnd - propsStart));
+			if (styles[i]->propertiesText == NULL) {
+				free(styles[i]->className);
+				free(styles[i]);
+			} else {
+				styles[i]->next = p->styles;
+				p->styles = styles[i];
+			}
 		}
+
 		if (*s)
 			s++; // advance past '}'
 	}
